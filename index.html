@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Stick Duel: Arena</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+  <!-- ======================= MAIN MENU ======================= -->
+  <div id="screen-main" class="screen active">
+    <div class="panel">
+      <h1 class="title">STICK<span>DUEL</span></h1>
+      <p class="subtitle">2‑4 Player Stickman Arena Fighter</p>
+
+      <label class="field">
+        <span>Player Name</span>
+        <input id="input-player-name" type="text" maxlength="12" placeholder="Fighter" />
+      </label>
+
+      <div class="btn-row">
+        <button id="btn-goto-create" class="btn btn-primary">Create Room</button>
+        <button id="btn-goto-join" class="btn btn-secondary">Join Room</button>
+      </div>
+
+      <p class="hint">Connections are peer‑to‑peer (WebRTC) — no game server required.</p>
+    </div>
+  </div>
+
+  <!-- ======================= CREATE ROOM ======================= -->
+  <div id="screen-create" class="screen">
+    <div class="panel">
+      <h2>Create Room</h2>
+      <div id="create-status" class="status">Generating room…</div>
+      <div class="room-code-box">
+        <span id="room-code-display">------</span>
+        <button id="btn-copy-code" class="btn btn-small">Copy</button>
+      </div>
+      <p class="hint">Share this Room ID with friends so they can join.</p>
+      <button id="btn-back-from-create" class="btn btn-ghost">← Back</button>
+    </div>
+  </div>
+
+  <!-- ======================= JOIN ROOM ======================= -->
+  <div id="screen-join" class="screen">
+    <div class="panel">
+      <h2>Join Room</h2>
+      <label class="field">
+        <span>Room ID</span>
+        <input id="input-room-id" type="text" maxlength="12" placeholder="e.g. XJ4K9P" autocapitalize="characters" />
+      </label>
+      <div id="join-status" class="status"></div>
+      <div class="btn-row">
+        <button id="btn-do-join" class="btn btn-primary">Join</button>
+        <button id="btn-back-from-join" class="btn btn-ghost">← Back</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ======================= LOBBY ======================= -->
+  <div id="screen-lobby" class="screen">
+    <div class="panel panel-wide">
+      <h2>Lobby <span id="lobby-room-code" class="room-tag"></span></h2>
+
+      <div id="lobby-players" class="lobby-players"></div>
+
+      <div class="loadout">
+        <div class="loadout-group">
+          <span class="loadout-label">Weapon</span>
+          <div id="weapon-select" class="chip-row"></div>
+        </div>
+        <div class="loadout-group">
+          <span class="loadout-label">Power</span>
+          <div id="power-select" class="chip-row"></div>
+        </div>
+        <div class="loadout-group" id="killtarget-group" style="display:none;">
+          <span class="loadout-label">Match ends at (host only)</span>
+          <div id="killtarget-select" class="chip-row"></div>
+        </div>
+      </div>
+
+      <div class="btn-row">
+        <button id="btn-ready" class="btn btn-primary">Ready</button>
+        <button id="btn-start-match" class="btn btn-accent" style="display:none;">Start Match</button>
+        <button id="btn-leave-lobby" class="btn btn-ghost">Leave</button>
+      </div>
+      <p id="lobby-hint" class="hint"></p>
+    </div>
+  </div>
+
+  <!-- ======================= GAME SCREEN ======================= -->
+  <div id="screen-game" class="screen">
+    <div id="hud-top" class="hud-top"></div>
+
+    <div id="canvas-wrap">
+      <canvas id="game-canvas" width="1280" height="720"></canvas>
+      <div id="match-hud" class="match-hud"></div>
+      <div id="hud-cooldowns" class="hud-cooldowns">
+        <div class="cd" id="cd-attack"><span>J</span></div>
+        <div class="cd" id="cd-heavy"><span>K</span></div>
+        <div class="cd" id="cd-skill"><span>L</span></div>
+        <div class="cd" id="cd-ult"><span>Q</span></div>
+      </div>
+      <div id="round-banner" class="round-banner"></div>
+      <div id="kill-banner" class="kill-banner"></div>
+      <div id="pickup-toast" class="pickup-toast"></div>
+    </div>
+
+    <div class="controls-legend">
+      A/D Move &nbsp;·&nbsp; W Jump &nbsp;·&nbsp; Space Dash &nbsp;·&nbsp; J Attack &nbsp;·&nbsp; K Heavy &nbsp;·&nbsp; L Skill &nbsp;·&nbsp; Q Ultimate &nbsp;·&nbsp; F Pick Up Item
+    </div>
+  </div>
+
+  <!-- ======================= WINNER SCREEN ======================= -->
+  <div id="screen-winner" class="screen">
+    <div class="panel">
+      <h2>Match Over</h2>
+      <div id="winner-name" class="winner-name">—</div>
+      <button id="btn-restart" class="btn btn-primary">Restart</button>
+      <button id="btn-to-menu" class="btn btn-ghost">Main Menu</button>
+    </div>
+  </div>
+
+  <!-- PeerJS: WebRTC data-channel networking via PeerJS's free public
+       signaling broker (signaling uses WebSocket under the hood).
+       No custom backend / Node / Express server is required. -->
+  <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+
+  <script src="effects.js"></script>
+  <script src="weapon.js"></script>
+  <script src="player.js"></script>
+  <script src="multiplayer.js"></script>
+  <script src="ui.js"></script>
+  <script src="game.js"></script>
+</body>
+</html>
