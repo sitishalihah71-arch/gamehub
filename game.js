@@ -13,6 +13,17 @@ const ITEM_PICKUP_RADIUS = 60;      // how close (px) a player must be to press 
 const ITEM_SPAWN_MIN = 10000;       // Feature 2: spawn every 10-20s
 const ITEM_SPAWN_MAX = 20000;
 const MAX_ITEMS_ON_MAP = 5;
+// Regular per-frame state broadcasts are throttled to this rate. This was
+// previously uncapped (send every simulated frame, ~60Hz) on the reasoning
+// that LAN play is latency-bound, not bandwidth-bound — true on a local
+// network, but not when a connection is relayed through a TURN server
+// (required whenever direct P2P can't traverse NAT between two different
+// networks, e.g. two players not on the same WiFi). The free relay this
+// project uses is shared and rate-limited, so flooding it at 60Hz can
+// itself become the bottleneck. 20Hz still feels responsive layered on top
+// of real internet RTT, at roughly a third of the bandwidth. Match-ending
+// snapshots still bypass this entirely (see _onKill's forced _broadcastSnapshot()).
+const SNAPSHOT_INTERVAL_MS = 1000 / 20;
 
 // Feature 2: item type metadata used for spawning, rendering and pickup text
 const ITEM_TYPES = {
@@ -77,6 +88,7 @@ class Game {
     this._lastPickupEventId = null;
     this._victoryFxAccum = 0;
     this._winnerTimeoutHandle = null;
+    this._snapshotAccum = 0; // host only: accumulates dt between throttled state broadcasts
 
     // Match Coin Reward System: a small rolling queue of recent coin-reward
     // events (not a single dedup'd field like lastKillEvent) so a burst of
@@ -184,6 +196,7 @@ class Game {
     this.lastKillEvent = null; this._lastKillEventId = null; this._killEventCounter = 0;
     this.lastPickupEvent = null; this._lastPickupEventId = null;
     this._matchCoinEvents = []; this._coinEventCounter = 0; this._lastCoinEventId = 0;
+    this._snapshotAccum = 0;
     this.heldKeys.clear();
     this.justPressed.clear();
 
@@ -220,6 +233,7 @@ class Game {
     this.lastKillEvent = null; this._lastKillEventId = null; this._killEventCounter = 0;
     this.lastPickupEvent = null; this._lastPickupEventId = null;
     this._matchCoinEvents = []; this._coinEventCounter = 0; this._lastCoinEventId = 0;
+    this._snapshotAccum = 0;
 
     // Bugfix: a Restart used to reset every disconnected flag to false,
     // silently reviving players who had actually left mid-match. Drop them
@@ -353,9 +367,14 @@ class Game {
     // kill flips `running` to false mid-tick, and previously that meant the
     // final snapshot carrying winnerId could be skipped entirely, leaving
     // clients stuck without ever finding out who won (see _onKill, which
-    // also force-sends one immediately the instant the match ends).
+    // also force-sends one immediately the instant the match ends, bypassing
+    // this throttle entirely).
     if (this.net.isHost && (this.running || this.matchEnding)) {
-      this._broadcastSnapshot();
+      this._snapshotAccum += dt;
+      if (this._snapshotAccum >= SNAPSHOT_INTERVAL_MS) {
+        this._snapshotAccum = 0;
+        this._broadcastSnapshot();
+      }
     }
 
     if (this.running || this.matchEnding) {
@@ -818,9 +837,12 @@ class Game {
 
   _clientTick(dt) {
     // Higher multiplier = snappier catch-up to the host's authoritative
-    // position. 16 took ~120ms to converge 90% of the way, which stacked
-    // visibly on top of network RTT; 26 cuts that to ~65-70ms.
-    const factor = Math.min(1, (dt / 1000) * 26);
+    // position, but too high relative to how often fresh data actually
+    // arrives (SNAPSHOT_INTERVAL_MS) produces a "snap then hold still"
+    // stutter instead of smooth motion between updates. 26 was tuned for
+    // the old uncapped ~60Hz broadcast; 20 spreads the catch-up more evenly
+    // across the ~20Hz cadence used now (see SNAPSHOT_INTERVAL_MS).
+    const factor = Math.min(1, (dt / 1000) * 20);
     for (const p of this.players.values()) {
       if (p.targetX === undefined) continue;
       p.x += (p.targetX - p.x) * factor;
