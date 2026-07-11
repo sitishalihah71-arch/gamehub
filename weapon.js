@@ -94,6 +94,14 @@ class Weapon {
     const def = WEAPON_TYPES[typeId] || WEAPON_TYPES.sword;
     Object.assign(this, def);
   }
+
+  // Cosmetic-only color override (Wardrobe weapon skins) — never touches
+  // damage/range/speed, so equipping a skin can't affect balance.
+  applySkin(skinParams) {
+    if (!skinParams) return;
+    if (skinParams.color) this.color = skinParams.color;
+    if (skinParams.accent) this.accent = skinParams.accent;
+  }
 }
 
 class Power {

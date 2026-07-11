@@ -17,9 +17,15 @@ class UIManager {
     this.selectedKillTarget = 10; // host-only "match ends at N kills" (Feature 1)
     this.localReady = false;
 
+    // Single source of truth for cosmetics — WardrobeUI reads/writes this
+    // same instance (not a copy), so an equip in the Wardrobe is instantly
+    // reflected everywhere else that reads ui.profile (lobby, room create/join).
+    this.profile = PlayerProfile.load();
+
     this._cacheDom();
     this._wireEvents();
     this._buildLoadoutChips();
+    this.wardrobe = new WardrobeUI(this);
     this.showScreen('main');
   }
 
@@ -31,6 +37,7 @@ class UIManager {
       lobby: document.getElementById('screen-lobby'),
       game: document.getElementById('screen-game'),
       winner: document.getElementById('screen-winner'),
+      wardrobe: document.getElementById('screen-wardrobe'),
     };
     this.nameInput = document.getElementById('input-player-name');
     this.roomCodeDisplay = document.getElementById('room-code-display');
@@ -51,8 +58,15 @@ class UIManager {
     this.roundBanner = document.getElementById('round-banner');
     this.killBanner = document.getElementById('kill-banner');
     this.pickupToast = document.getElementById('pickup-toast');
+    this.coinRewardStack = document.getElementById('coin-reward-stack');
     this.winnerName = document.getElementById('winner-name');
     this.winnerPanel = this.winnerName ? this.winnerName.closest('.panel') : null;
+    this.matchSummaryList = document.getElementById('match-summary-list');
+    this.walletDeposit = document.getElementById('wallet-deposit');
+    this.walletDepositValue = document.getElementById('wallet-deposit-value');
+    this.walletDepositDelta = document.getElementById('wallet-deposit-delta');
+    this.btnRestart = document.getElementById('btn-restart');
+    this.btnToMenu = document.getElementById('btn-to-menu');
     this.cdEls = {
       attack: document.getElementById('cd-attack'),
       heavy: document.getElementById('cd-heavy'),
@@ -103,6 +117,17 @@ class UIManager {
     document.getElementById('btn-to-menu').onclick = () => {
       this._onLeave && this._onLeave();
       this.showScreen('main');
+    };
+    // Wardrobe is reachable only from inside the Lobby (never the main menu
+    // or the game screen) — that's what enforces "no wardrobe changes once
+    // the match has started" without needing a separate runtime guard.
+    document.getElementById('btn-goto-wardrobe').onclick = () => {
+      this.showScreen('wardrobe');
+      this.wardrobe.open();
+    };
+    document.getElementById('btn-back-from-wardrobe').onclick = () => {
+      this.wardrobe.close();
+      this.showScreen('lobby');
     };
   }
 
@@ -183,6 +208,10 @@ class UIManager {
   showScreen(name) {
     Object.values(this.screens).forEach(s => s.classList.remove('active'));
     this.screens[name].classList.add('active');
+    // Catch-all: whatever navigated us away from the winner screen (Restart,
+    // Main Menu, Leave) stops its preview animation loop, so it never keeps
+    // running invisibly in the background.
+    if (name !== 'winner' && this._stopWinnerPreview) this._stopWinnerPreview();
   }
 
   setRoomCode(code) {
@@ -198,16 +227,19 @@ class UIManager {
   }
 
   updateLobby(rosterArray, isHost, localId) {
+    this._lobbyRoster = rosterArray; // cached for refreshLobbyPreviews()'s instant local feedback
     this.lobbyPlayers.innerHTML = '';
     rosterArray.forEach((p, i) => {
       const card = document.createElement('div');
       card.className = 'lobby-player-card' + (p.ready ? ' ready' : '');
       const wName = WEAPON_TYPES[p.weapon] ? WEAPON_TYPES[p.weapon].name : p.weapon;
       const pName = POWER_TYPES[p.power] ? POWER_TYPES[p.power].name : p.power;
-      card.innerHTML = `<div class="lp-name" style="color:${PLAYER_COLORS[i % 4]}"><span class="lp-dot"></span>${this._esc(p.name)}${p.isHost ? ' 👑' : ''}${p.id === localId ? ' (you)' : ''}</div>
+      card.innerHTML = `<canvas class="lp-preview" width="64" height="80" id="lp-preview-${p.id}"></canvas>
+        <div class="lp-name" style="color:${PLAYER_COLORS[i % 4]}"><span class="lp-dot"></span>${this._esc(p.name)}${p.isHost ? ' 👑' : ''}${p.id === localId ? ' (you)' : ''}</div>
         <div class="lp-meta">${wName} · ${pName}</div>
         <div class="lp-meta">${p.ready ? 'Ready' : 'Not ready'}</div>`;
       this.lobbyPlayers.appendChild(card);
+      this._drawLobbyPreview(p, i);
     });
 
     this.btnStartMatch.style.display = isHost ? 'inline-block' : 'none';
@@ -217,6 +249,42 @@ class UIManager {
     this.lobbyHint.textContent = isHost
       ? (allReady ? 'Everyone is ready — start when you like!' : 'Waiting for all players to ready up…')
       : 'Waiting for the host to start the match…';
+  }
+
+  // Every player's equipped cosmetics rendered as a small static thumbnail
+  // in their lobby card — reuses Player.draw() (same code path as the
+  // Wardrobe preview and the actual match), so nobody's look ever drifts
+  // between "what the lobby showed" and "what the match shows".
+  _drawLobbyPreview(rosterEntry, colorIndex) {
+    const canvas = document.getElementById('lp-preview-' + rosterEntry.id);
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    if (!this._lobbyPreviewPlayer) this._lobbyPreviewPlayer = new Player('lobby-preview', '', 0, 0, PLAYER_COLORS[0], 'sword', 'fire');
+    const p = this._lobbyPreviewPlayer;
+    p.facing = 1; p.state = 'idle'; p.animPhase = 0; p.invulnTimer = 0; p.alive = true;
+    p.color = PLAYER_COLORS[colorIndex % 4];
+    p.weapon = new Weapon(rosterEntry.weapon);
+    p.power = new Power(rosterEntry.power);
+    p.cosmetics = rosterEntry.cosmetics || null;
+    ctx.save();
+    ctx.translate(canvas.width / 2, canvas.height * 0.92);
+    ctx.scale(0.58, 0.58);
+    p.x = 0; p.y = 0;
+    p.draw(ctx, { showHpBar: false });
+    ctx.restore();
+  }
+
+  // Called by WardrobeUI right after an equip so the local player's own
+  // lobby card updates instantly, without waiting on the network round-trip
+  // that setLocalCosmetics's broadcast normally takes for everyone else.
+  refreshLobbyPreviews() {
+    if (!this._lobbyRoster) return;
+    const localId = this.net && this.net.localId;
+    this._lobbyRoster.forEach((p, i) => {
+      if (p.id === localId) p.cosmetics = resolveEquippedCosmetics(this.profile);
+      this._drawLobbyPreview(p, i);
+    });
   }
 
   _esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
@@ -340,6 +408,20 @@ class UIManager {
     this.playPickupSound();
   }
 
+  // Match Coin Reward System: unlike the other toasts above (a single
+  // reused element), this creates a brand-new element per call so several
+  // can be visible and stacked at once when kills happen in quick
+  // succession — the whole pop-in/hold/float-up-fade lifecycle is one CSS
+  // animation (see style.css), so this just needs to append and later remove.
+  showCoinReward(amount, ms = 2000) {
+    if (!this.coinRewardStack) return;
+    const toast = document.createElement('div');
+    toast.className = 'coin-reward-toast';
+    toast.innerHTML = `<span class="coin-reward-icon">\u{1FA99}</span><span class="coin-reward-text">+${amount} Coins</span>`;
+    this.coinRewardStack.appendChild(toast);
+    setTimeout(() => toast.remove(), ms);
+  }
+
   playPickupSound() {
     try {
       if (!this._audioCtx) this._audioCtx = new (window.AudioContext || window.webkitAudioContext)();
@@ -357,7 +439,14 @@ class UIManager {
     } catch (e) { /* audio not available — silently ignore */ }
   }
 
-  showWinner(name, color) {
+  // Takes the actual winning Player instance (or null for a draw), the full
+  // list of Player instances for the Match Results summary, and the local
+  // wallet balance from just before this match's rewards were deposited
+  // (for the counting-up deposit animation) — reuses Player.draw() again
+  // rather than a separate static graphic for every avatar involved.
+  showWinner(winnerPlayer, allPlayers = [], walletBefore = null) {
+    const name = winnerPlayer ? winnerPlayer.name : null;
+    const color = winnerPlayer ? winnerPlayer.color : null;
     this.winnerName.textContent = name ? `${name} wins!` : 'Draw!';
     this.winnerName.style.color = color || '#ffce54';
     this.showScreen('winner');
@@ -365,5 +454,181 @@ class UIManager {
       this.winnerPanel.classList.add('victory-pulse');
       setTimeout(() => this.winnerPanel.classList.remove('victory-pulse'), 4000);
     }
+    this._startWinnerPreview(winnerPlayer);
+    this._renderMatchSummary(allPlayers, winnerPlayer);
+    this._runWalletDeposit(walletBefore);
+  }
+
+  // Match Results: one card per player (avatar reusing Player.draw(),
+  // name, kills/deaths, coins earned this match, winner badge), sorted by
+  // kills so the standings read top-to-bottom like a scoreboard.
+  _renderMatchSummary(allPlayers, winnerPlayer) {
+    if (!this.matchSummaryList) return;
+    this.matchSummaryList.innerHTML = '';
+    const medals = ['\u{1F947}', '\u{1F948}', '\u{1F949}'];
+    [...allPlayers].sort((a, b) => b.score - a.score).forEach((p, i) => {
+      const isWinner = !!(winnerPlayer && p.id === winnerPlayer.id);
+      const card = document.createElement('div');
+      card.className = 'match-summary-card' + (isWinner ? ' winner' : '');
+      card.innerHTML = `
+        <canvas class="match-summary-avatar" id="summary-avatar-${p.id}" width="52" height="64"></canvas>
+        <div class="match-summary-info">
+          <div class="match-summary-name" style="color:${p.color}">
+            ${medals[i] || ''} ${this._esc(p.name)}
+            ${isWinner ? '<span class="match-summary-badge">WINNER</span>' : ''}
+          </div>
+          <div class="match-summary-stats">Kills: ${p.score} &nbsp;·&nbsp; Deaths: ${p.deaths}</div>
+        </div>
+        <div class="match-summary-coins">\u{1FA99} +${p.matchCoins || 0}</div>
+      `;
+      this.matchSummaryList.appendChild(card);
+      this._drawSummaryAvatar(p);
+    });
+  }
+
+  // Draws the REAL Player instance directly (not a proxy like the lobby
+  // preview needs, since these are already live Player objects from the
+  // match) — temporarily repositions it to the small canvas's local origin
+  // and restores it afterward so nothing about the actual match state leaks.
+  _drawSummaryAvatar(p) {
+    const canvas = document.getElementById('summary-avatar-' + p.id);
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    const savedX = p.x, savedY = p.y, savedState = p.state, savedAlive = p.alive, savedInvuln = p.invulnTimer;
+    p.state = 'idle';
+    p.alive = true;
+    p.invulnTimer = 0;
+    ctx.save();
+    ctx.translate(canvas.width / 2, canvas.height * 0.92);
+    ctx.scale(0.55, 0.55);
+    p.x = 0; p.y = 0;
+    p.draw(ctx, { showHpBar: false });
+    ctx.restore();
+    p.x = savedX; p.y = savedY; p.state = savedState; p.alive = savedAlive; p.invulnTimer = savedInvuln;
+  }
+
+  // Coin Deposit Animation: counts the wallet up from its pre-match value to
+  // its new value (already applied to this.profile.coins by the time this
+  // runs), with a sparkle burst and a short synthesized "cha-ching" once it
+  // lands. Restart/Main Menu stay disabled until it finishes, per spec.
+  _runWalletDeposit(walletBefore) {
+    if (!this.walletDepositValue) return;
+    const after = this.profile.coins;
+    if (typeof walletBefore !== 'number') {
+      this.walletDepositValue.textContent = after;
+      this._setWinnerButtonsDisabled(false);
+      return;
+    }
+    const delta = after - walletBefore;
+    this._setWinnerButtonsDisabled(true);
+    this.walletDepositValue.textContent = walletBefore;
+    if (this.walletDepositDelta) {
+      this.walletDepositDelta.textContent = delta > 0 ? `+${delta}` : '';
+      this.walletDepositDelta.classList.toggle('show', delta > 0);
+    }
+
+    if (delta <= 0) {
+      this._setWinnerButtonsDisabled(false);
+      return;
+    }
+
+    this.playCoinDepositSound();
+    const durationMs = Math.min(1800, Math.max(500, delta * 25));
+    const startTime = performance.now();
+    const step = (now) => {
+      const t = Math.min(1, (now - startTime) / durationMs);
+      const eased = 1 - Math.pow(1 - t, 3); // ease-out cubic — starts fast, settles gently
+      this.walletDepositValue.textContent = Math.round(walletBefore + delta * eased);
+      if (t < 1) {
+        requestAnimationFrame(step);
+      } else {
+        this.walletDepositValue.textContent = after;
+        this._spawnWalletSparkle();
+        this._setWinnerButtonsDisabled(false);
+      }
+    };
+    requestAnimationFrame(step);
+  }
+
+  _spawnWalletSparkle() {
+    if (!this.walletDeposit) return;
+    const count = 6;
+    for (let i = 0; i < count; i++) {
+      const sparkle = document.createElement('span');
+      sparkle.className = 'wallet-sparkle';
+      const angle = (Math.PI * 2 * i) / count + Math.random() * 0.4;
+      const dist = 22 + Math.random() * 16;
+      sparkle.style.setProperty('--dx', (Math.cos(angle) * dist).toFixed(1) + 'px');
+      sparkle.style.setProperty('--dy', (Math.sin(angle) * dist).toFixed(1) + 'px');
+      sparkle.textContent = '✦';
+      this.walletDeposit.appendChild(sparkle);
+      setTimeout(() => sparkle.remove(), 700);
+    }
+  }
+
+  _setWinnerButtonsDisabled(disabled) {
+    if (this.btnRestart) this.btnRestart.disabled = disabled;
+    if (this.btnToMenu) this.btnToMenu.disabled = disabled;
+  }
+
+  playCoinDepositSound() {
+    try {
+      if (!this._audioCtx) this._audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      const ctx = this._audioCtx;
+      [660, 880, 1180].forEach((freq, i) => {
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.type = 'triangle';
+        const t0 = ctx.currentTime + i * 0.08;
+        osc.frequency.setValueAtTime(freq, t0);
+        gain.gain.setValueAtTime(0.16, t0);
+        gain.gain.exponentialRampToValueAtTime(0.001, t0 + 0.16);
+        osc.connect(gain).connect(ctx.destination);
+        osc.start(t0);
+        osc.stop(t0 + 0.16);
+      });
+    } catch (e) { /* audio not available — silently ignore */ }
+  }
+
+  _startWinnerPreview(winnerPlayer) {
+    this._stopWinnerPreview();
+    const canvas = document.getElementById('winner-preview-canvas');
+    if (!canvas || !winnerPlayer) return;
+    const ctx = canvas.getContext('2d');
+    if (!this._winnerPreviewPlayer) this._winnerPreviewPlayer = new Player('winner-preview', '', 0, 0, PLAYER_COLORS[0], 'sword', 'fire');
+    const preview = this._winnerPreviewPlayer;
+    preview.color = winnerPlayer.color;
+    preview.weapon = winnerPlayer.weapon;
+    preview.power = winnerPlayer.power;
+    preview.cosmetics = winnerPlayer.cosmetics;
+    preview.facing = 1;
+    preview.state = winnerPlayer.victoryPoseId ? 'victory' : 'idle';
+    preview.victoryPoseId = winnerPlayer.victoryPoseId;
+    preview.animTimer = 0;
+    preview.animPhase = 0;
+    preview.invulnTimer = 0;
+    preview.alive = true;
+
+    let last = performance.now();
+    const loop = (now) => {
+      const dt = Math.min(50, now - last);
+      last = now;
+      preview.animTimer += dt;
+      preview.animPhase += dt * 0.006;
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.save();
+      ctx.translate(canvas.width / 2, canvas.height * 0.86);
+      ctx.scale(1.5, 1.5);
+      preview.x = 0; preview.y = 0;
+      preview.draw(ctx, { showHpBar: false });
+      ctx.restore();
+      this._winnerPreviewRaf = requestAnimationFrame(loop);
+    };
+    this._winnerPreviewRaf = requestAnimationFrame(loop);
+  }
+
+  _stopWinnerPreview() {
+    if (this._winnerPreviewRaf) { cancelAnimationFrame(this._winnerPreviewRaf); this._winnerPreviewRaf = null; }
   }
 }

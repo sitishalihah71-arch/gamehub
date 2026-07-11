@@ -4,7 +4,7 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>Stick Duel: Arena</title>
-<link rel="stylesheet" href="style.css" />
+<link rel="stylesheet" href="style.css?v=2" />
 </head>
 <body>
 
@@ -25,6 +25,56 @@
       </div>
 
       <p class="hint">Connections are peer‑to‑peer (WebRTC) — no game server required.</p>
+    </div>
+  </div>
+
+  <!-- ======================= WARDROBE ======================= -->
+  <div id="screen-wardrobe" class="screen">
+    <div class="panel panel-wardrobe">
+      <div class="wardrobe-header">
+        <h2>Wardrobe</h2>
+        <div class="wardrobe-coins-badge">&#128176; <span id="wardrobe-coins">0 coins</span></div>
+        <button id="btn-back-from-wardrobe" class="btn btn-ghost btn-small">&larr; Back</button>
+      </div>
+
+      <div class="wardrobe-body">
+        <div class="wardrobe-preview-panel">
+          <canvas id="wardrobe-preview-canvas" width="360" height="440"></canvas>
+          <div class="wardrobe-zoom-row">
+            <span>Zoom</span>
+            <input type="range" id="wardrobe-zoom" min="0.6" max="1.8" step="0.05" value="1.1" />
+          </div>
+          <div id="wardrobe-hair-color-row" class="wardrobe-hair-color-row" style="display:none;">
+            <span class="wardrobe-hair-color-label">Hair Color</span>
+            <div id="wardrobe-hair-color-swatches" class="hair-color-swatches"></div>
+            <input type="color" id="wardrobe-hair-color-input" class="hair-color-input" value="#ffffff" />
+            <button id="btn-wardrobe-hair-color-reset" class="btn btn-ghost btn-small">Reset</button>
+          </div>
+          <div class="wardrobe-detail">
+            <div id="wardrobe-detail-name" class="wardrobe-detail-name">Select a skin</div>
+            <div id="wardrobe-detail-rarity" class="wardrobe-detail-rarity"></div>
+            <div id="wardrobe-detail-req" class="wardrobe-detail-req"></div>
+            <div class="btn-row">
+              <button id="btn-wardrobe-equip" class="btn btn-primary btn-small" style="display:none;">Equip</button>
+              <button id="btn-wardrobe-buy" class="btn btn-accent btn-small" style="display:none;">Buy</button>
+              <button id="btn-wardrobe-preview-victory" class="btn btn-secondary btn-small" style="display:none;">Preview</button>
+            </div>
+          </div>
+          <div class="wardrobe-lootbox-row">
+            <button id="btn-wardrobe-lootbox" class="btn btn-wardrobe btn-small">Open Loot Box</button>
+            <div id="wardrobe-lootbox-result" class="wardrobe-lootbox-result"></div>
+          </div>
+        </div>
+
+        <div class="wardrobe-catalog-panel">
+          <div id="wardrobe-tabs" class="wardrobe-tabs"></div>
+          <div class="wardrobe-filters-row">
+            <div id="wardrobe-rarity-filter" class="chip-row"></div>
+            <input id="wardrobe-search" type="text" placeholder="Search skins…" class="wardrobe-search-input" />
+          </div>
+          <div id="wardrobe-grid" class="wardrobe-grid"></div>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -81,6 +131,7 @@
       </div>
 
       <div class="btn-row">
+        <button id="btn-goto-wardrobe" class="btn btn-wardrobe">&#127912; Wardrobe</button>
         <button id="btn-ready" class="btn btn-primary">Ready</button>
         <button id="btn-start-match" class="btn btn-accent" style="display:none;">Start Match</button>
         <button id="btn-leave-lobby" class="btn btn-ghost">Leave</button>
@@ -105,6 +156,7 @@
       <div id="round-banner" class="round-banner"></div>
       <div id="kill-banner" class="kill-banner"></div>
       <div id="pickup-toast" class="pickup-toast"></div>
+      <div id="coin-reward-stack" class="coin-reward-stack"></div>
     </div>
 
     <div class="controls-legend">
@@ -114,11 +166,23 @@
 
   <!-- ======================= WINNER SCREEN ======================= -->
   <div id="screen-winner" class="screen">
-    <div class="panel">
+    <div class="panel panel-winner">
       <h2>Match Over</h2>
+      <canvas id="winner-preview-canvas" width="180" height="210"></canvas>
       <div id="winner-name" class="winner-name">—</div>
-      <button id="btn-restart" class="btn btn-primary">Restart</button>
-      <button id="btn-to-menu" class="btn btn-ghost">Main Menu</button>
+
+      <div id="match-summary-list" class="match-summary-list"></div>
+
+      <div id="wallet-deposit" class="wallet-deposit">
+        <span class="wallet-deposit-icon">&#129689;</span>
+        <span id="wallet-deposit-value" class="wallet-deposit-value">0</span>
+        <span id="wallet-deposit-delta" class="wallet-deposit-delta"></span>
+      </div>
+
+      <div class="btn-row">
+        <button id="btn-restart" class="btn btn-primary">Restart</button>
+        <button id="btn-to-menu" class="btn btn-ghost">Main Menu</button>
+      </div>
     </div>
   </div>
 
@@ -127,11 +191,17 @@
        No custom backend / Node / Express server is required. -->
   <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
 
-  <script src="effects.js"></script>
-  <script src="weapon.js"></script>
-  <script src="player.js"></script>
-  <script src="multiplayer.js"></script>
-  <script src="ui.js"></script>
-  <script src="game.js"></script>
+  <!-- Cache-busting query strings (?v=N) — browsers otherwise happily keep
+       serving a stale cached copy of these after any edit, which is exactly
+       what caused a "the fix isn't showing up" report during development.
+       Bump the number whenever these files change. -->
+  <script src="effects.js?v=2"></script>
+  <script src="weapon.js?v=2"></script>
+  <script src="cosmetics.js?v=2"></script>
+  <script src="player.js?v=2"></script>
+  <script src="multiplayer.js?v=2"></script>
+  <script src="ui.js?v=2"></script>
+  <script src="wardrobe.js?v=2"></script>
+  <script src="game.js?v=2"></script>
 </body>
 </html>

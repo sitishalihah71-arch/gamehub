@@ -78,6 +78,14 @@ class Game {
     this._victoryFxAccum = 0;
     this._winnerTimeoutHandle = null;
 
+    // Match Coin Reward System: a small rolling queue of recent coin-reward
+    // events (not a single dedup'd field like lastKillEvent) so a burst of
+    // rapid kills can't drop a notification — the client processes every
+    // new id it hasn't seen yet, which is what lets toasts stack correctly.
+    this._matchCoinEvents = [];
+    this._coinEventCounter = 0;
+    this._lastCoinEventId = 0;
+
     this.heldKeys = new Set();
     this.justPressed = new Set();
     this._bindKeyboard();
@@ -135,7 +143,7 @@ class Game {
 
   // ---------------------------------------------------------- flows
   handleCreateRoom() {
-    this.net.createRoom(this.ui.localName, this.ui.selectedWeapon, this.ui.selectedPower)
+    this.net.createRoom(this.ui.localName, this.ui.selectedWeapon, this.ui.selectedPower, resolveEquippedCosmetics(this.ui.profile))
       .then((id) => {
         this.ui.setRoomCode(id);
         setTimeout(() => this.ui.goToLobby(), 300);
@@ -144,7 +152,7 @@ class Game {
   }
 
   handleJoinRoom(code) {
-    this.net.joinRoom(code, this.ui.localName, this.ui.selectedWeapon, this.ui.selectedPower)
+    this.net.joinRoom(code, this.ui.localName, this.ui.selectedWeapon, this.ui.selectedPower, resolveEquippedCosmetics(this.ui.profile))
       .then(() => this.ui.goToLobby())
       .catch((err) => { this.ui.joinStatus.textContent = err; });
   }
@@ -175,6 +183,7 @@ class Game {
     this.killTarget = [10, 30, 50].includes(killTarget) ? killTarget : DEFAULT_KILL_TARGET;
     this.lastKillEvent = null; this._lastKillEventId = null; this._killEventCounter = 0;
     this.lastPickupEvent = null; this._lastPickupEventId = null;
+    this._matchCoinEvents = []; this._coinEventCounter = 0; this._lastCoinEventId = 0;
     this.heldKeys.clear();
     this.justPressed.clear();
 
@@ -183,6 +192,10 @@ class Game {
       const p = new Player(r.id, r.name, sp.x, sp.y, PLAYER_COLORS[i % 4], r.weapon, r.power);
       p.spawnX = sp.x; p.spawnY = sp.y;
       p.targetX = sp.x; p.targetY = sp.y;
+      // Cosmetics were resolved locally (resolveEquippedCosmetics) and carried
+      // in the roster the whole time the player sat in the lobby — apply them
+      // now so they're visible from the very first frame of the match.
+      p.cosmetics = r.cosmetics || null;
       this.players.set(r.id, p);
     });
 
@@ -206,6 +219,7 @@ class Game {
     clearTimeout(this._winnerTimeoutHandle);
     this.lastKillEvent = null; this._lastKillEventId = null; this._killEventCounter = 0;
     this.lastPickupEvent = null; this._lastPickupEventId = null;
+    this._matchCoinEvents = []; this._coinEventCounter = 0; this._lastCoinEventId = 0;
 
     // Bugfix: a Restart used to reset every disconnected flag to false,
     // silently reviving players who had actually left mid-match. Drop them
@@ -223,7 +237,9 @@ class Game {
       p.alive = true;
       p.score = 0;
       p.deaths = 0;
+      p.matchCoins = 0;
       p.state = 'idle';
+      p.victoryPoseId = null; // cosmetics themselves (p.cosmetics) are untouched by restart
       p.currentAttack = null;
       p.invulnTimer = 1200;
       // reset cooldowns / ultimate gauge
@@ -323,6 +339,13 @@ class Game {
           w.power, 40, 14
         );
       }
+      // Host ticks the winner's Victory Animation clock (reuses animTimer,
+      // same as any other state-driven animation) and broadcasts it below —
+      // clients never run _hostTick, so they'd otherwise never see it advance.
+      if (this.net.isHost) {
+        const winner = this.players.get(this.winnerId);
+        if (winner) winner.animTimer += dt;
+      }
     }
 
     // Broadcast state whenever there's something clients need to see — this
@@ -332,7 +355,7 @@ class Game {
     // clients stuck without ever finding out who won (see _onKill, which
     // also force-sends one immediately the instant the match ends).
     if (this.net.isHost && (this.running || this.matchEnding)) {
-      this.net.sendState(this._buildSnapshot());
+      this._broadcastSnapshot();
     }
 
     if (this.running || this.matchEnding) {
@@ -528,6 +551,7 @@ class Game {
     defender.deaths += 1;
     this.effects.spawnHitSpark(defender.x, defender.y - defender.height * 0.5, '#ff5c5c', 24);
     this._announceDeath(defender.name, attacker.name);
+    this._awardCoins(attacker, 10, 'kill'); // Match Coin Reward System — instant floating toast for the killer
 
     if (attacker.score >= this.killTarget && !this.matchOver) {
       // Feature 1: freeze gameplay immediately, play a short victory
@@ -537,16 +561,69 @@ class Game {
       this.running = false;
       this.matchEnding = true;
       this._victoryFxAccum = 0;
+      // Kick off the winner's equipped Victory Animation — reuses state +
+      // animTimer exactly like attack/skill/ult poses (see Player.draw).
+      attacker.state = 'victory';
+      attacker.animTimer = 0;
+      attacker.victoryPoseId = (attacker.cosmetics && attacker.cosmetics.victory) ? attacker.cosmetics.victory.style : null;
+      // End-of-match coin bonuses, tallied silently into matchCoins (no
+      // floating toast — they're revealed on the Match Results screen
+      // instead, which would otherwise be competing for attention with a
+      // burst of "+10"/"+25" toasts right as the victory freeze kicks in).
+      for (const p of this.players.values()) {
+        if (p.disconnected) continue;
+        this._awardCoins(p, 10, 'participation', false);
+        if (p.id === attacker.id) this._awardCoins(p, 25, 'victory', false);
+      }
       // Force-send the winning snapshot right now rather than waiting for
       // the next _loop tick's broadcast — guarantees every client learns
       // the match ended and who won, even if this exact tick is unlucky.
-      this.net.sendState(this._buildSnapshot());
+      this._broadcastSnapshot();
       clearTimeout(this._winnerTimeoutHandle);
       this._winnerTimeoutHandle = setTimeout(() => {
         this.matchEnding = false;
-        this.ui.showWinner(attacker.name, attacker.color);
+        const walletBefore = this.ui.profile.coins;
+        this._awardMatchRewards();
+        this.ui.showWinner(attacker, Array.from(this.players.values()), walletBefore);
       }, 5000);
     }
+  }
+
+  // Match Coin Reward System — the single source of truth for "coins earned
+  // this match" (Player.matchCoins), consumed by both the floating toast
+  // (notify=true, e.g. a kill) and the end-of-match summary/wallet deposit
+  // (notify=false sources just tally silently). Host-authoritative: only
+  // ever called from host-side code (_onKill), and matchCoins syncs to
+  // clients via the snapshot like score/deaths already do — see
+  // _buildSnapshot/applySnapshot. Adding a new coin source later (kill
+  // streaks, match missions, ...) is just another call to this method.
+  _awardCoins(player, amount, source, notify = true) {
+    player.matchCoins += amount;
+    if (!notify) return;
+    this._coinEventCounter += 1;
+    this._matchCoinEvents.push({ id: this._coinEventCounter, playerId: player.id, amount, source });
+    if (this._matchCoinEvents.length > 20) this._matchCoinEvents.shift();
+    // Host shows its own toast immediately (no network round-trip needed);
+    // remote clients pick up the same event from the synced snapshot below.
+    if (player.id === this.localPlayerId) this.ui.showCoinReward(amount);
+  }
+
+  // Coins/stats are tracked per-browser (PlayerProfile, cosmetics.js) with
+  // no shared economy across peers, so every player — host and each client
+  // alike — independently rewards their OWN profile based on their OWN
+  // matchCoins total (kills + participation + victory bonus, all already
+  // tallied via _awardCoins above) once their local view of the match
+  // concludes. Called once from each of the two match-end paths below (host
+  // via _onKill, clients via applySnapshot) right before the winner screen.
+  _awardMatchRewards() {
+    const me = this.players.get(this.localPlayerId);
+    if (!me) return;
+    this.ui.profile.awardMatchResult({
+      won: this.winnerId === this.localPlayerId,
+      kills: me.score,
+      deaths: me.deaths,
+      matchCoins: me.matchCoins,
+    });
   }
 
   // ---------------------------------------------------------- items (Feature 2/3)
@@ -602,6 +679,18 @@ class Game {
   }
 
   // ---------------------------------------------------------- snapshotting
+  // Sends a snapshot and drains the coin-events queue. Safe to drain rather
+  // than keep resending: NetworkManager connections are opened with
+  // {reliable: true} (multiplayer.js), so a broadcast that goes out is
+  // guaranteed to arrive — unlike lastKillEvent/lastPickupEvent's
+  // resend-forever-until-superseded pattern, coinEvents doesn't need that
+  // insurance, and draining keeps the payload from growing for the rest of
+  // the match every time someone gets a kill.
+  _broadcastSnapshot() {
+    this.net.sendState(this._buildSnapshot());
+    this._matchCoinEvents.length = 0;
+  }
+
   // Positions/timers are rounded before going over the wire — sub-pixel and
   // sub-millisecond precision is invisible on screen but bloats the JSON
   // payload sent every broadcast tick.
@@ -617,16 +706,26 @@ class Game {
         weapon: p.weapon.id, weaponName: p.weapon.name, power: p.power.id,
         attackCooldown: ri(p.attackCooldown), heavyCooldown: ri(p.heavyCooldown),
         dashCooldown: ri(p.dashCooldown), skillCooldown: ri(p.skillCooldown), ultCooldown: ri(p.ultCooldown),
-        score: p.score, deaths: p.deaths, invulnTimer: ri(p.invulnTimer),
+        score: p.score, deaths: p.deaths, matchCoins: p.matchCoins, invulnTimer: ri(p.invulnTimer),
         shieldTimer: ri(p.shieldTimer), tempWeaponTimer: ri(p.tempWeaponTimer),
         ultTelegraph: p.ultTelegraph ? { radius: p.ultTelegraph.radius, color: p.ultTelegraph.color } : null,
         currentAttack: p.currentAttack ? { type: p.currentAttack.type, duration: p.currentAttack.duration } : null,
+        victoryPoseId: p.victoryPoseId,
       })),
       projectiles: this.projectiles.map(pr => ({ x: r1(pr.x), y: r1(pr.y), power: pr.power.id, ownerId: pr.ownerId })),
       items: this.items.map(it => ({ id: it.id, type: it.type, x: it.x, y: it.y })),
       killTarget: this.killTarget,
       lastKillEvent: this.lastKillEvent,
       lastPickupEvent: this.lastPickupEvent,
+      // Last few coin-reward events (not just the latest one) — a rapid
+      // multi-kill can generate more than one between broadcast ticks, and
+      // clients only care about the ones they haven't already processed
+      // (see applySnapshot's _lastCoinEventId watermark below). Sliced to a
+      // fresh array: _broadcastSnapshot drains _matchCoinEvents right after
+      // this returns, and since PeerJS sends can be deferred under
+      // connection backpressure, a snapshot holding the *same* array
+      // reference could see it emptied before it's actually transmitted.
+      coinEvents: this._matchCoinEvents.slice(),
       winnerId: this.winnerId,
     };
   }
@@ -660,7 +759,9 @@ class Game {
       p.ultTelegraph = ps.ultTelegraph; // {radius,color} or null — Feature 4 render-only indicator
       p.score = ps.score;
       p.deaths = ps.deaths || 0;
+      p.matchCoins = ps.matchCoins || 0;
       p.currentAttack = ps.currentAttack;
+      p.victoryPoseId = ps.victoryPoseId || null;
     }
     this.projectiles = snap.projectiles.map(ps => ({
       x: ps.x, y: ps.y,
@@ -677,6 +778,18 @@ class Game {
       this._lastKillEventId = snap.lastKillEvent.id;
       const { victim, killer } = snap.lastKillEvent;
       this.ui.showKillBanner(killer ? `${victim} has been killed by ${killer}` : `${victim} fell to their doom`);
+    }
+
+    // Match Coin Reward System: process every event newer than the last one
+    // we've seen (not just the latest, unlike the dedup'd fields above) so a
+    // burst of rapid kills can't drop a toast — each new event belonging to
+    // the local player pops its own stacking floating notification.
+    if (snap.coinEvents && snap.coinEvents.length) {
+      for (const ev of snap.coinEvents) {
+        if (ev.id <= this._lastCoinEventId) continue;
+        this._lastCoinEventId = ev.id;
+        if (ev.playerId === this.localPlayerId) this.ui.showCoinReward(ev.amount);
+      }
     }
 
     // Feature 3: pickup toast, shown only to the player who picked it up
@@ -696,7 +809,9 @@ class Game {
       clearTimeout(this._winnerTimeoutHandle);
       this._winnerTimeoutHandle = setTimeout(() => {
         this.matchEnding = false;
-        this.ui.showWinner(w ? w.name : null, w ? w.color : null);
+        const walletBefore = this.ui.profile.coins;
+        this._awardMatchRewards();
+        this.ui.showWinner(w || null, Array.from(this.players.values()), walletBefore);
       }, 5000);
     }
   }

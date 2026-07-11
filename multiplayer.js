@@ -53,10 +53,10 @@ class NetworkManager {
     // client-side: connection to host
     this.hostConnection = null;
 
-    // roster shared in the lobby: id -> {name, weapon, power, ready, isHost}
+    // roster shared in the lobby: id -> {name, weapon, power, cosmetics, ready, isHost}
     this.roster = new Map();
 
-    this._lastLoadout = null;     // {name, weapon, power} — resent on reconnect
+    this._lastLoadout = null;     // {name, weapon, power, cosmetics} — resent on reconnect
     this._intentionalClose = false;
     this._failCurrentJoin = null; // settles the in-flight join promise on an immediate rejection (e.g. room full)
 
@@ -80,7 +80,7 @@ class NetworkManager {
     return s;
   }
 
-  createRoom(playerName, weapon, power) {
+  createRoom(playerName, weapon, power, cosmetics) {
     return new Promise((resolve, reject) => {
       const roomId = 'SD-' + this._makeRoomCode();
       this.peer = new Peer(roomId, PEER_CONFIG);
@@ -89,7 +89,7 @@ class NetworkManager {
 
       this.peer.on('open', (id) => {
         this.localId = id;
-        this.roster.set(id, { name: playerName, weapon, power, ready: false, isHost: true, id });
+        this.roster.set(id, { name: playerName, weapon, power, cosmetics: cosmetics || null, ready: false, isHost: true, id });
         this._emitRoster();
         if (this.onOpen) this.onOpen(id);
         resolve(id);
@@ -112,10 +112,10 @@ class NetworkManager {
     });
   }
 
-  joinRoom(roomId, playerName, weapon, power) {
+  joinRoom(roomId, playerName, weapon, power, cosmetics) {
     this.isHost = false;
     this.roomId = roomId;
-    this._lastLoadout = { name: playerName, weapon, power };
+    this._lastLoadout = { name: playerName, weapon, power, cosmetics: cosmetics || null };
     this._joined = false; // true only once we've actually received the roster (host accepted us)
 
     return new Promise((resolve, reject) => {
@@ -172,8 +172,8 @@ class NetworkManager {
       if (handshakeSettled) return;
       handshakeSettled = true;
       clearTimeout(failTimer);
-      const { name, weapon, power } = this._lastLoadout;
-      conn.send({ type: 'join', name, weapon, power, id: this.localId });
+      const { name, weapon, power, cosmetics } = this._lastLoadout;
+      conn.send({ type: 'join', name, weapon, power, cosmetics, id: this.localId });
       if (this.onOpen) this.onOpen(this.localId);
     });
 
@@ -218,8 +218,8 @@ class NetworkManager {
 
     conn.on('open', () => {
       clearTimeout(timer);
-      const { name, weapon, power } = this._lastLoadout;
-      conn.send({ type: 'join', name, weapon, power, id: this.localId, rejoin: true });
+      const { name, weapon, power, cosmetics } = this._lastLoadout;
+      conn.send({ type: 'join', name, weapon, power, cosmetics, id: this.localId, rejoin: true });
     });
     conn.on('data', (data) => this._handleClientData(data));
     conn.on('close', () => {
@@ -261,7 +261,7 @@ class NetworkManager {
         // instead of resetting it, since it's the same player resuming.
         const prevReady = this.roster.has(conn.peer) ? this.roster.get(conn.peer).ready : false;
         this.roster.set(conn.peer, {
-          name: data.name, weapon: data.weapon, power: data.power,
+          name: data.name, weapon: data.weapon, power: data.power, cosmetics: data.cosmetics || null,
           ready: data.rejoin ? prevReady : false, isHost: false, id: conn.peer,
         });
         this._broadcastRoster();
@@ -274,6 +274,11 @@ class NetworkManager {
           const r = this.roster.get(conn.peer);
           r.weapon = data.weapon; r.power = data.power;
         }
+        this._broadcastRoster();
+        this._emitRoster();
+        break;
+      case 'cosmetics':
+        if (this.roster.has(conn.peer)) this.roster.get(conn.peer).cosmetics = data.cosmetics;
         this._broadcastRoster();
         this._emitRoster();
         break;
@@ -306,6 +311,17 @@ class NetworkManager {
     }
     if (this.isHost) { this._broadcastRoster(); this._emitRoster(); }
     else if (this.hostConnection) this.hostConnection.send({ type: 'loadout', weapon, power });
+  }
+
+  // Pushes an equipped-cosmetics change (from the Wardrobe, opened inside
+  // the lobby) to every other player immediately — same broadcast pattern
+  // as setLocalLoadout. Also updates _lastLoadout so a reconnect/rejoin
+  // resends the current cosmetics instead of stale ones from initial join.
+  setLocalCosmetics(cosmetics) {
+    if (this._lastLoadout) this._lastLoadout.cosmetics = cosmetics;
+    if (this.roster.has(this.localId)) this.roster.get(this.localId).cosmetics = cosmetics;
+    if (this.isHost) { this._broadcastRoster(); this._emitRoster(); }
+    else if (this.hostConnection) this.hostConnection.send({ type: 'cosmetics', cosmetics });
   }
 
   setLocalReady(ready) {

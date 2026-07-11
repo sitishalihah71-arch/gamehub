@@ -69,6 +69,18 @@ class Player {
     this.currentAttack = null; // {type,duration,hitFrom,hitTo,hasHit,dmg,range,knockback}
     this.score = 0; // kills
     this.deaths = 0;
+    this.matchCoins = 0; // coins earned THIS match only (kills, participation, victory bonus, etc.) — separate from the permanent wallet (PlayerProfile.coins in cosmetics.js)
+
+    // Wardrobe cosmetics — resolved params keyed by category (see
+    // cosmetics.js: resolveEquippedCosmetics()), or null for "no cosmetics
+    // applied" so existing gameplay/rendering is byte-for-byte unaffected
+    // until something actually equips a skin.
+    this.cosmetics = null;
+
+    // Victory Animation cosmetic playback — set when a match ends (game.js
+    // _onKill) or when previewed in the Wardrobe. Reuses state/animTimer
+    // (state='victory') instead of adding a parallel animation clock.
+    this.victoryPoseId = null;
 
     this.spawnX = x; this.spawnY = y;
 
@@ -344,10 +356,15 @@ class Player {
     this.invulnTimer = 1500;
     this.currentAttack = null;
     this.comboCount = 0;
+    this.victoryPoseId = null; // cosmetics themselves (this.cosmetics) are untouched by respawn
   }
 
   // =========================== RENDER ===========================
-  draw(ctx) {
+  // opts.showHpBar=false is used by the Wardrobe preview canvas (see
+  // wardrobe.js), which reuses this exact method so the preview can never
+  // visually drift from how the player actually looks in a real match.
+  draw(ctx, opts = {}) {
+    const showHpBar = opts.showHpBar !== false;
     if (!this.alive) return;
     ctx.save();
     ctx.translate(this.x, this.y);
@@ -356,7 +373,13 @@ class Player {
       ctx.globalAlpha = 0.4;
     }
 
-    const c = this.color;
+    // Character Skin cosmetic recolors the whole figure (a 'rainbow' primary
+    // cycles hue over time for Mythic skins). Falls back to the player's
+    // chosen color when no cosmetic is equipped — zero behavior change.
+    const charSkin = this.cosmetics && this.cosmetics.character;
+    const c = charSkin && charSkin.primary
+      ? (charSkin.primary === 'rainbow' ? rainbowColor(Date.now() / 1000) : charSkin.primary)
+      : this.color;
     ctx.lineCap = 'round';
     ctx.lineJoin = 'round';
     ctx.strokeStyle = c;
@@ -376,6 +399,7 @@ class Player {
     if (this.state === 'fall') { legSwing = 0.3; armSwing = 0.5; }
     if (this.state === 'dash') { lean = this.facing * 0.5; legSwing = 0.5; }
     if (this.state === 'hit') { lean = -this.facing * 0.3; }
+    if (this.state === 'victory') legSwing = -0.15; // slightly widened, confident stance
 
     ctx.save();
     ctx.rotate(lean * 0.15);
@@ -394,7 +418,7 @@ class Player {
     ctx.lineTo(0, shoulderY);
     ctx.stroke();
 
-    // arms + weapon (drawn by attack-state logic)
+    // arms + weapon (drawn by attack-state / victory-pose logic)
     this._drawArmsAndWeapon(ctx, shoulderY, armSwing);
 
     // head
@@ -402,12 +426,251 @@ class Player {
     ctx.arc(0, headY, headR, 0, Math.PI * 2);
     ctx.fill();
 
+    // Hair -> Face Expression -> Helmet, in that order, so a helmet always
+    // layers above hair (per spec) while the expression stays visible
+    // rather than being covered by a hairstyle.
+    if (this.cosmetics) {
+      this._drawHair(ctx, headY, headR, c);
+      this._drawFaceExpression(ctx, headY, headR);
+      this._drawHelmet(ctx, headY, headR);
+    }
+
     ctx.restore();
 
     ctx.globalAlpha = 1;
     ctx.restore();
 
-    this._drawNamePlate(ctx);
+    if (showHpBar) this._drawNamePlate(ctx);
+  }
+
+  // ---- Wardrobe cosmetic overlays -------------------------------------
+  // Each is a small, self-contained procedural shape keyed by the equipped
+  // skin's `style` id (see cosmetics.js SKIN_CATALOG). Unknown/null styles
+  // draw nothing, so adding new catalog entries never requires touching
+  // gameplay code beyond adding a case here.
+  _drawHelmet(ctx, headY, headR) {
+    const helm = this.cosmetics.helmet;
+    if (!helm || !helm.style) return;
+    ctx.save();
+    ctx.fillStyle = helm.color;
+    ctx.strokeStyle = helm.color;
+    ctx.lineWidth = 3;
+    switch (helm.style) {
+      case 'cap':
+        ctx.beginPath();
+        ctx.arc(0, headY - 2, headR + 1, Math.PI, Math.PI * 2);
+        ctx.fill();
+        break;
+      case 'horns':
+        ctx.beginPath();
+        ctx.moveTo(-headR * 0.7, headY - headR * 0.4); ctx.lineTo(-headR * 1.6, headY - headR * 1.8);
+        ctx.moveTo(headR * 0.7, headY - headR * 0.4); ctx.lineTo(headR * 1.6, headY - headR * 1.8);
+        ctx.stroke();
+        break;
+      case 'crown':
+        ctx.beginPath();
+        ctx.moveTo(-headR, headY - headR); ctx.lineTo(-headR * 0.5, headY - headR * 2);
+        ctx.lineTo(0, headY - headR * 1.3); ctx.lineTo(headR * 0.5, headY - headR * 2);
+        ctx.lineTo(headR, headY - headR);
+        ctx.stroke();
+        break;
+      case 'halo': {
+        const t = Date.now() / 1000;
+        ctx.save();
+        ctx.globalAlpha = 0.85;
+        ctx.shadowBlur = 14;
+        ctx.shadowColor = helm.color;
+        ctx.beginPath();
+        ctx.ellipse(0, headY - headR * 2.4 - Math.sin(t * 2) * 2, headR * 1.1, headR * 0.35, 0, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.restore();
+        break;
+      }
+    }
+    ctx.restore();
+  }
+
+  // Eyes + mouth, keyed by the equipped expression's `style` id. Drawn in a
+  // bright color with a soft dark halo (shadowBlur) so it reads clearly
+  // against any Character Skin color, light or dark, without per-skin logic.
+  _drawFaceExpression(ctx, headY, headR) {
+    const expr = this.cosmetics.expression;
+    if (!expr || !expr.style) return;
+    ctx.save();
+    ctx.shadowBlur = 2.5;
+    ctx.shadowColor = '#000000';
+    ctx.strokeStyle = '#ffffff';
+    ctx.fillStyle = '#ffffff';
+    ctx.lineWidth = 1.4;
+    ctx.lineCap = 'round';
+
+    const eyeY = headY - headR * 0.15;
+    const eyeDX = headR * 0.42;
+    const mouthY = headY + headR * 0.4;
+
+    const dotEyes = () => {
+      ctx.beginPath();
+      ctx.arc(-eyeDX, eyeY, 1.1, 0, Math.PI * 2);
+      ctx.arc(eyeDX, eyeY, 1.1, 0, Math.PI * 2);
+      ctx.fill();
+    };
+    const browsAngled = (inward) => {
+      // inward=true: eyebrows angle down toward the nose (angry/determined);
+      // inward=false: angle up toward the nose (sad).
+      const d = inward ? 1.6 : -1.6;
+      ctx.beginPath();
+      ctx.moveTo(-eyeDX - 2.2, eyeY - 2.2 + d); ctx.lineTo(-eyeDX + 2.2, eyeY - 2.2 - d);
+      ctx.moveTo(eyeDX - 2.2, eyeY - 2.2 - d); ctx.lineTo(eyeDX + 2.2, eyeY - 2.2 + d);
+      ctx.stroke();
+    };
+
+    switch (expr.style) {
+      case 'neutral':
+        dotEyes();
+        ctx.beginPath(); ctx.moveTo(-2.5, mouthY); ctx.lineTo(2.5, mouthY); ctx.stroke();
+        break;
+      case 'smile':
+        dotEyes();
+        ctx.beginPath(); ctx.arc(0, mouthY - 1.5, 3, 0.15 * Math.PI, 0.85 * Math.PI); ctx.stroke();
+        break;
+      case 'happy':
+        // closed, upward-curved "^ ^" eyes + a big open smile
+        ctx.beginPath();
+        ctx.arc(-eyeDX, eyeY + 1, 2, Math.PI, 0); ctx.arc(eyeDX, eyeY + 1, 2, Math.PI, 0);
+        ctx.stroke();
+        ctx.beginPath(); ctx.arc(0, mouthY - 2, 3.6, 0.1 * Math.PI, 0.9 * Math.PI); ctx.stroke();
+        break;
+      case 'angry':
+        dotEyes();
+        browsAngled(true);
+        ctx.beginPath(); ctx.moveTo(-2.5, mouthY); ctx.lineTo(2.5, mouthY - 1); ctx.stroke();
+        break;
+      case 'sad':
+        dotEyes();
+        browsAngled(false);
+        ctx.beginPath(); ctx.arc(0, mouthY + 2.5, 3, 1.15 * Math.PI, 1.85 * Math.PI); ctx.stroke();
+        break;
+      case 'cool':
+        // sunglasses bar instead of eyes
+        ctx.fillRect(-eyeDX - 2.5, eyeY - 1.5, eyeDX * 2 + 5, 3);
+        ctx.beginPath(); ctx.moveTo(-2, mouthY); ctx.lineTo(2.5, mouthY - 1); ctx.stroke();
+        break;
+      case 'surprised':
+        ctx.beginPath();
+        ctx.arc(-eyeDX, eyeY, 1.8, 0, Math.PI * 2); ctx.arc(eyeDX, eyeY, 1.8, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.beginPath(); ctx.arc(0, mouthY + 1, 2, 0, Math.PI * 2); ctx.stroke();
+        break;
+      case 'determined':
+        dotEyes();
+        browsAngled(true);
+        ctx.beginPath(); ctx.moveTo(-2.5, mouthY); ctx.lineTo(2.5, mouthY); ctx.stroke();
+        break;
+    }
+    ctx.restore();
+  }
+
+  // Hairstyles framing the head. `baseColor` is the player's resolved
+  // display color (Character Skin, or the default color) — used whenever
+  // the equipped hair's own color is null, i.e. "inherit the character
+  // palette" per spec. Drawn before the Helmet so a helmet always layers
+  // above hair.
+  _drawHair(ctx, headY, headR, baseColor) {
+    const hair = this.cosmetics.hair;
+    if (!hair || !hair.style) return;
+    const f = this.facing;
+    const sway = Math.sin(this.animPhase) * 2; // subtle idle movement for flowing styles
+    ctx.save();
+    const color = hair.color || baseColor;
+    ctx.strokeStyle = color;
+    ctx.fillStyle = color;
+    switch (hair.style) {
+      case 'short':
+        ctx.lineWidth = 3;
+        ctx.beginPath(); ctx.arc(0, headY - 1, headR + 0.5, Math.PI * 1.05, Math.PI * 1.95); ctx.stroke();
+        break;
+      case 'messy':
+        ctx.lineWidth = 2.5;
+        for (let i = -2; i <= 2; i++) {
+          ctx.beginPath();
+          ctx.moveTo(i * headR * 0.35, headY - headR * 0.75);
+          ctx.lineTo(i * headR * 0.4, headY - headR * 1.35 - Math.abs(i) * 1.2);
+          ctx.stroke();
+        }
+        break;
+      case 'ponytail':
+        ctx.lineWidth = 3;
+        ctx.beginPath(); ctx.arc(0, headY - 1, headR + 0.5, Math.PI * 1.05, Math.PI * 1.95); ctx.stroke();
+        ctx.lineWidth = 3.5;
+        ctx.beginPath();
+        ctx.moveTo(-f * headR * 0.7, headY - headR * 0.6);
+        ctx.quadraticCurveTo(-f * headR * 1.8, headY, -f * headR * 1.4 + sway, headY + headR * 1.6);
+        ctx.stroke();
+        break;
+      case 'bobcut':
+        ctx.lineWidth = 3;
+        ctx.beginPath(); ctx.arc(0, headY - 1, headR + 1, Math.PI * 0.95, Math.PI * 2.05); ctx.stroke();
+        break;
+      case 'mullet':
+        ctx.lineWidth = 3;
+        ctx.beginPath(); ctx.arc(0, headY - 1, headR + 0.5, Math.PI * 1.05, Math.PI * 1.95); ctx.stroke();
+        ctx.lineWidth = 3;
+        ctx.beginPath();
+        ctx.moveTo(-headR * 0.3, headY + headR * 0.5);
+        ctx.quadraticCurveTo(-headR * 0.6, headY + headR * 1.4, -headR * 0.3 + sway * 0.5, headY + headR * 2);
+        ctx.stroke();
+        break;
+      case 'long':
+        ctx.lineWidth = 3.5;
+        ctx.beginPath();
+        ctx.moveTo(-headR * 0.9, headY - headR * 0.3);
+        ctx.quadraticCurveTo(-headR * 1.5 + sway, headY + headR * 1.2, -headR * 0.6 + sway, headY + headR * 2.6);
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(headR * 0.9, headY - headR * 0.3);
+        ctx.quadraticCurveTo(headR * 1.5 - sway, headY + headR * 1.2, headR * 0.6 - sway, headY + headR * 2.6);
+        ctx.stroke();
+        ctx.lineWidth = 3;
+        ctx.beginPath(); ctx.arc(0, headY - 1, headR + 0.5, Math.PI * 1.05, Math.PI * 1.95); ctx.stroke();
+        break;
+      case 'bun':
+        ctx.lineWidth = 3;
+        ctx.beginPath(); ctx.arc(0, headY - 1, headR + 0.5, Math.PI * 1.05, Math.PI * 1.95); ctx.stroke();
+        ctx.beginPath(); ctx.arc(0, headY - headR * 1.5, headR * 0.5, 0, Math.PI * 2); ctx.fill();
+        break;
+      case 'spiky':
+        ctx.lineWidth = 3;
+        for (let i = -2; i <= 2; i++) {
+          ctx.beginPath();
+          ctx.moveTo(i * headR * 0.4, headY - headR * 0.7);
+          ctx.lineTo(i * headR * 0.4, headY - headR * 1.7);
+          ctx.stroke();
+        }
+        break;
+      case 'twintail':
+        ctx.lineWidth = 3.5;
+        ctx.beginPath();
+        ctx.moveTo(-headR * 0.8, headY - headR * 0.4);
+        ctx.quadraticCurveTo(-headR * 1.9, headY - headR * 0.2, -headR * 1.5 + sway, headY + headR * 1.2);
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(headR * 0.8, headY - headR * 0.4);
+        ctx.quadraticCurveTo(headR * 1.9, headY - headR * 0.2, headR * 1.5 - sway, headY + headR * 1.2);
+        ctx.stroke();
+        break;
+      case 'mohawk':
+        ctx.lineWidth = 4;
+        ctx.beginPath();
+        ctx.moveTo(0, headY - headR * 0.9);
+        ctx.lineTo(0, headY - headR * 2.6);
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(-2.5, headY - headR * 0.9); ctx.lineTo(0, headY - headR * 2.1);
+        ctx.moveTo(2.5, headY - headR * 0.9); ctx.lineTo(0, headY - headR * 2.1);
+        ctx.stroke();
+        break;
+    }
+    ctx.restore();
   }
 
   _drawArmsAndWeapon(ctx, shoulderY, armSwing) {
@@ -416,7 +679,9 @@ class Player {
     ctx.lineWidth = 5;
 
     let handX = f * 14, handY = shoulderY + 14;
+    let backArmX = -f * 10, backArmY = shoulderY + 18;
     let weaponAngle = f * 0.9; // relative angle of weapon line
+    let hideWeapon = false;
 
     if (this.currentAttack) {
       const a = this.currentAttack;
@@ -440,12 +705,19 @@ class Player {
       ctx.arc(handX, handY, 16 + t * 10, 0, Math.PI * 2);
       ctx.fill();
       ctx.restore();
+    } else if (this.state === 'victory' && this.victoryPoseId) {
+      const t = (this.animTimer % 1200) / 1200; // 0..1, loops every 1.2s
+      const pose = this._computeVictoryPose(this.victoryPoseId, t, f, shoulderY);
+      handX = pose.handX; handY = pose.handY;
+      backArmX = pose.backArmX; backArmY = pose.backArmY;
+      weaponAngle = pose.weaponAngle;
+      hideWeapon = pose.hideWeapon;
     }
 
     // back arm
     ctx.beginPath();
     ctx.moveTo(0, shoulderY);
-    ctx.lineTo(-f * 10, shoulderY + 18);
+    ctx.lineTo(backArmX, backArmY);
     ctx.stroke();
 
     // front arm to hand
@@ -454,10 +726,15 @@ class Player {
     ctx.lineTo(handX, handY);
     ctx.stroke();
 
-    // weapon line from hand
-    const wx = handX + Math.cos(weaponAngle) * w.range * 0.55 * f * 0 + Math.cos(weaponAngle) * 30;
-    const wy = handY + Math.sin(weaponAngle) * 30 - 10;
-    ctx.strokeStyle = w.color;
+    if (hideWeapon) { ctx.strokeStyle = this.color; return; }
+
+    // weapon line from hand — a Weapon Skin cosmetic overrides color/accent
+    // display only; damage/range/speed stay whatever the equipped Weapon
+    // instance defines, so cosmetics can never affect balance.
+    const wSkin = this.cosmetics && this.cosmetics.weaponSkin;
+    const weaponColor = (wSkin && wSkin.color) || w.color;
+    const weaponAccent = (wSkin && wSkin.accent) || w.accent;
+    ctx.strokeStyle = weaponColor;
     ctx.lineWidth = w.id === 'hammer' ? 7 : w.id === 'spear' ? 3 : 5;
     ctx.beginPath();
     ctx.moveTo(handX, handY);
@@ -465,12 +742,42 @@ class Player {
     ctx.lineTo(handX + Math.cos(weaponAngle) * len, handY + Math.sin(weaponAngle) * len - 8);
     ctx.stroke();
     if (w.id === 'hammer') {
-      ctx.fillStyle = w.accent;
+      ctx.fillStyle = weaponAccent;
       ctx.beginPath();
       ctx.arc(handX + Math.cos(weaponAngle) * len, handY + Math.sin(weaponAngle) * len - 8, 7, 0, Math.PI * 2);
       ctx.fill();
     }
     ctx.strokeStyle = this.color;
+  }
+
+  // Distinct arm/weapon parametrization per Victory Animation style — the
+  // stick-figure equivalent of a full-body animation clip. `t` loops 0..1.
+  _computeVictoryPose(styleId, t, f, shoulderY) {
+    const wave = Math.sin(t * Math.PI * 2);
+    switch (styleId) {
+      case 'wave':
+        return { handX: f * (6 + wave * 16), handY: shoulderY - 22, backArmX: -f * 10, backArmY: shoulderY + 18, weaponAngle: f * 0.9, hideWeapon: false };
+      case 'thumbsup':
+        return { handX: f * 20, handY: shoulderY - 4 + wave * 2, backArmX: -f * 10, backArmY: shoulderY + 18, weaponAngle: f * 0.9, hideWeapon: false };
+      case 'peace':
+        return { handX: f * 14, handY: shoulderY - 20, backArmX: -f * 10, backArmY: shoulderY + 18, weaponAngle: f * 0.9, hideWeapon: false };
+      case 'salute':
+        return { handX: f * 10, handY: shoulderY - 24, backArmX: -f * 10, backArmY: shoulderY + 18, weaponAngle: f * 0.9, hideWeapon: false };
+      case 'flex':
+        return { handX: f * 22, handY: shoulderY + 4, backArmX: -f * 22, backArmY: shoulderY + 4, weaponAngle: f * 0.9, hideWeapon: true };
+      case 'hero':
+        return { handX: f * 10, handY: shoulderY - 26, backArmX: -f * 6, backArmY: shoulderY + 16, weaponAngle: f * 0.9, hideWeapon: true };
+      case 'swordspin':
+        return { handX: f * 16, handY: shoulderY + 10, backArmX: -f * 10, backArmY: shoulderY + 18, weaponAngle: t * Math.PI * 4, hideWeapon: false };
+      case 'celebrate':
+        return {
+          handX: f * (14 + Math.sin(t * Math.PI * 4) * 4), handY: shoulderY - 24 + wave * 3,
+          backArmX: -f * (14 + Math.cos(t * Math.PI * 4) * 4), backArmY: shoulderY - 22 + Math.cos(t * Math.PI * 2) * 3,
+          weaponAngle: f * 0.9, hideWeapon: true,
+        };
+      default:
+        return { handX: f * 14, handY: shoulderY + 14, backArmX: -f * 10, backArmY: shoulderY + 18, weaponAngle: f * 0.9, hideWeapon: false };
+    }
   }
 
   _drawNamePlate(ctx) {
