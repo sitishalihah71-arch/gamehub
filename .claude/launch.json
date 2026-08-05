@@ -3,8 +3,8 @@
   "configurations": [
     {
       "name": "politikish",
-      "runtimeExecutable": "sh",
-      "runtimeArgs": ["-c", "cd /Users/syahz/Downloads/files-2/politikish && python3 -m http.server 8843"],
+      "runtimeExecutable": "node",
+      "runtimeArgs": ["/Users/syahz/Downloads/files-2/politikish/serve.mjs"],
       "port": 8843
     }
   ]
